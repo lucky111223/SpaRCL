@@ -7,10 +7,8 @@ import pandas as pd
 from tqdm import tqdm
 import scipy.sparse as sp
 from sklearn.neighbors import NearestNeighbors
-
 from .mnn_utils import create_dictionary_mnn
 from .SpaRCL import SpaRCL
-
 import torch
 import torch.backends.cudnn as cudnn
 
@@ -44,7 +42,6 @@ def pretrain_SpaRCL(adata, hidden_dims=[512, 30], n_epochs=1000, lr=0.001, key_a
     if 'Spatial_Net' not in adata.uns.keys():
         raise ValueError("Spatial_Net is not existed! Run Cal_Spatial_Net first!")
 
-    # 注意：这里假设 Transfer_pytorch_Data 在你的其他 utils 中已经定义并导入
     data = Transfer_pytorch_Data(adata_Vars)
 
     model = SpaRCL(hidden_dims=[data.x.shape[1]] + hidden_dims).to(device)
@@ -69,7 +66,6 @@ def pretrain_SpaRCL(adata, hidden_dims=[512, 30], n_epochs=1000, lr=0.001, key_a
     pretrain_rep = z.to('cpu').detach().numpy()
     adata.obsm[key_added] = pretrain_rep
 
-    # 如果 save_loss 未定义，这里可能会报错，建议像原版一样加上 try-except 或确保定义
     try:
         if save_loss:
             adata.uns['SpaRCL_pre_loss'] = loss
@@ -82,7 +78,6 @@ def pretrain_SpaRCL(adata, hidden_dims=[512, 30], n_epochs=1000, lr=0.001, key_a
         adata.layers['SpaRCL_pre_ReX'] = ReX
 
     return adata
-
 
 def train_SpaRCL(adata, hidden_dims=[512, 30], n_epochs=1000, lr=0.001, key_added='SpaRCL',
                  gradient_clipping=5., weight_decay=0.0001, margin=1.0, verbose=False,
