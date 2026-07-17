@@ -174,7 +174,7 @@ def train_sparcl(
     """Train SpaRCL and store update diagnostics in ``adata.uns``.
 
     Positive centroids are detached targets rebuilt every ``update_interval``
-    epochs, matching the submitted implementation. Semi-hard negatives strictly
+    epochs, matching the revised Methods. Semi-hard negatives strictly
     satisfy ``d_pos < d_neg < d_pos + margin``. Anchors without a valid negative
     are skipped.
     """
