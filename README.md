@@ -18,14 +18,14 @@ The optional `mclust_R` function requires R, the R package `mclust`, and
 `rpy2`. The additional legacy alignment utilities use the packages listed in
 `requirements-optional.txt`.
 
-## Quick test
+## Installation check
 
 ```bash
 python examples/toy_demo.py --device cpu
 ```
 
-This example creates two small synthetic sections and writes the integrated
-embedding and training settings to `outputs/toy/`.
+This small synthetic example checks that the package can run after installation.
+It is not part of the experiments reported in the manuscript.
 
 ## DLPFC example
 
@@ -41,6 +41,9 @@ python examples/run_dlpfc4.py \
 ```
 
 Add `--run-mclust` when R and `mclust` are available.
+The DLPFC results displayed in Figures 2 and 3 used annotation-assisted negative
+filtering; add `--use-label-filter` to reproduce that training setting. Omit
+this flag for label-free training.
 
 ## Mouse embryo example
 
@@ -59,13 +62,12 @@ Run the full preprocessing and integration workflow with:
 python examples/run_mouse_embryo.py \
   --data-dir /path/to/mouse_embryo \
   --config configs/mouse_embryo.json \
-  --seed 0 \
-  --output-dir outputs/mouse_embryo_seed0
+  --seed 666 \
+  --output-dir outputs/mouse_embryo_seed666
 ```
 
-The mouse embryo example contains 95,896 spots and uses memory-bounded graph
-aggregation for an 8 GB GPU. It then applies Louvain clustering to the SpaRCL
-embedding with resolution 0.5 and random state 666.
+The workflow applies Louvain clustering to the SpaRCL embedding with resolution
+0.5 and random state 666.
 
 ## Main settings
 
