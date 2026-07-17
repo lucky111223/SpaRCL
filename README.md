@@ -18,15 +18,6 @@ The optional `mclust_R` function requires R, the R package `mclust`, and
 `rpy2`. The additional legacy alignment utilities use the packages listed in
 `requirements-optional.txt`.
 
-## Installation check
-
-```bash
-python examples/toy_demo.py --device cpu
-```
-
-This small synthetic example checks that the package can run after installation.
-It is not part of the experiments reported in the manuscript.
-
 ## DLPFC example
 
 Place the four SpatialLIBD/10x Visium sections `151673`, `151674`, `151675`,
@@ -36,14 +27,10 @@ and `151676` under one data directory, then run:
 python examples/run_dlpfc4.py \
   --data-dir /path/to/dlpfc \
   --config configs/dlpfc4.json \
-  --seed 0 \
-  --output-dir outputs/dlpfc4_seed0
+  --output-dir outputs/dlpfc4
 ```
 
 Add `--run-mclust` when R and `mclust` are available.
-The DLPFC results displayed in Figures 2 and 3 used annotation-assisted negative
-filtering; add `--use-label-filter` to reproduce that training setting. Omit
-this flag for label-free training.
 
 ## Mouse embryo example
 
@@ -62,8 +49,7 @@ Run the full preprocessing and integration workflow with:
 python examples/run_mouse_embryo.py \
   --data-dir /path/to/mouse_embryo \
   --config configs/mouse_embryo.json \
-  --seed 666 \
-  --output-dir outputs/mouse_embryo_seed666
+  --output-dir outputs/mouse_embryo
 ```
 
 The workflow applies Louvain clustering to the SpaRCL embedding with resolution
