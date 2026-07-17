@@ -52,8 +52,7 @@ python examples/run_mouse_embryo.py \
   --output-dir outputs/mouse_embryo
 ```
 
-The workflow applies Louvain clustering to the SpaRCL embedding with resolution
-0.5 and random state 666.
+The workflow applies Louvain clustering to the SpaRCL embedding.
 
 ## Main settings
 
