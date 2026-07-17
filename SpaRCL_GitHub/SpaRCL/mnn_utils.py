@@ -41,7 +41,7 @@ def create_dictionary_mnn(adata, use_rep, batch_name, k = 50, save_on_disk = Tru
         ds2 = adata[ref].obsm[use_rep]
         names1 = new
         names2 = ref
-        # if k>1，one point in ds1 may have multiple MNN points in ds2.
+        # If k > 1, one point in ds1 may have multiple MNN points in ds2.
         match = mnn(ds1, ds2, names1, names2, knn=k, save_on_disk = save_on_disk, approx = approx)
 
         G = nx.Graph()

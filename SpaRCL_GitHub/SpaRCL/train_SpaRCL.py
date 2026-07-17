@@ -1,346 +1,455 @@
-import time
-import psutil
-import gc
+"""SpaRCL training used for the Biology revision."""
+
+from __future__ import annotations
+
 import random
+import time
+import json
+from itertools import combinations
+from pathlib import Path
+from typing import Any
+
 import numpy as np
-import pandas as pd
-from tqdm import tqdm
 import scipy.sparse as sp
-from sklearn.neighbors import NearestNeighbors
-from .mnn_utils import create_dictionary_mnn
-from .SpaRCL import SpaRCL
 import torch
-import torch.backends.cudnn as cudnn
-
-cudnn.deterministic = True
-cudnn.benchmark = True
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+from sklearn.neighbors import NearestNeighbors
 from torch_geometric.data import Data
-from torch_geometric.loader import DataLoader
+from tqdm import tqdm
+
+from .SpaRCL import SpaRCL
+from .label_schema import LABEL_COLUMNS
 
 
-def pretrain_SpaRCL(adata, hidden_dims=[512, 30], n_epochs=1000, lr=0.001, key_added='SpaRCL_pre',
-                    gradient_clipping=5., weight_decay=0.0001, verbose=True,
-                    random_seed=0, save_reconstrction=False,
-                    device=torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')):
-    # seed_everything()
-    seed = random_seed
+VALID_NEGATIVE_STRATEGIES = ("semi-hard", "random")
+
+
+def _as_numpy(tensor: torch.Tensor) -> np.ndarray:
+    return np.asarray(tensor.detach().cpu().numpy(), dtype=np.float32).copy()
+
+
+def _set_seed(seed: int, deterministic_algorithms: bool = True) -> None:
     random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(deterministic_algorithms)
 
-    adata.X = sp.csr_matrix(adata.X)
 
-    if 'highly_variable' in adata.var.columns:
-        adata_Vars = adata[:, adata.var['highly_variable']]
-    else:
-        adata_Vars = adata
+def _exact_knn_matches(
+    query: np.ndarray,
+    reference: np.ndarray,
+    query_names: np.ndarray,
+    reference_names: np.ndarray,
+    k: int,
+) -> set[tuple[str, str]]:
+    neighbors = (
+        NearestNeighbors(n_neighbors=min(k, reference.shape[0]), metric="euclidean", n_jobs=1)
+        .fit(reference)
+        .kneighbors(query, return_distance=False)
+    )
+    return {
+        (str(query_names[row]), str(reference_names[column]))
+        for row, columns in enumerate(neighbors)
+        for column in columns
+    }
 
-    if verbose:
-        print('Size of Input: ', adata_Vars.shape)
-    if 'Spatial_Net' not in adata.uns.keys():
-        raise ValueError("Spatial_Net is not existed! Run Cal_Spatial_Net first!")
 
-    data = Transfer_pytorch_Data(adata_Vars)
+def _deterministic_mnn_dictionary(adata, use_rep: str, batch_name: str, k: int, iter_comb=None):
+    """Build the original MNN definition with exact KNN and deterministic edge order."""
 
-    model = SpaRCL(hidden_dims=[data.x.shape[1]] + hidden_dims).to(device)
-    data = data.to(device)
+    batches = list(adata.obs[batch_name].unique())
+    combinations_to_run = list(combinations(range(len(batches)), 2)) if iter_comb is None else list(iter_comb)
+    result: dict[str, dict[str, list[str]]] = {}
+    for first, second in combinations_to_run:
+        first_mask = adata.obs[batch_name].to_numpy() == batches[first]
+        second_mask = adata.obs[batch_name].to_numpy() == batches[second]
+        first_vectors = np.asarray(adata.obsm[use_rep][first_mask], dtype=np.float32)
+        second_vectors = np.asarray(adata.obsm[use_rep][second_mask], dtype=np.float32)
+        first_names = adata.obs_names[first_mask].to_numpy()
+        second_names = adata.obs_names[second_mask].to_numpy()
 
+        forward = _exact_knn_matches(second_vectors, first_vectors, second_names, first_names, k)
+        reverse = _exact_knn_matches(first_vectors, second_vectors, first_names, second_names, k)
+        mutual = sorted(forward & {(right, left) for left, right in reverse})
+
+        adjacency: dict[str, list[str]] = {}
+        for left, right in mutual:
+            adjacency.setdefault(left, []).append(right)
+            adjacency.setdefault(right, []).append(left)
+        pair_key = f"{batches[first]}_{batches[second]}"
+        result[pair_key] = {
+            anchor: sorted(neighbors) for anchor, neighbors in sorted(adjacency.items())
+        }
+    return result
+
+
+def _dense_float_tensor(x: Any) -> torch.Tensor:
+    if sp.issparse(x):
+        x = x.toarray()
+    return torch.as_tensor(np.asarray(x), dtype=torch.float32)
+
+
+def _spatial_neighbor_sets(edge_list: tuple[np.ndarray, np.ndarray], n_nodes: int) -> list[set[int]]:
+    neighbors = [set() for _ in range(n_nodes)]
+    for u, v in zip(edge_list[0], edge_list[1]):
+        u = int(u)
+        v = int(v)
+        if u == v:
+            continue
+        neighbors[u].add(v)
+        neighbors[v].add(u)
+    return neighbors
+
+
+def _same_batch_knn(
+    embedding: np.ndarray,
+    batches: np.ndarray,
+    n_neighbors: int,
+) -> list[np.ndarray | None]:
+    result: list[np.ndarray | None] = [None] * embedding.shape[0]
+    for batch in np.unique(batches):
+        batch_idx = np.flatnonzero(batches == batch)
+        if len(batch_idx) <= 1:
+            continue
+        n_eff = min(int(n_neighbors) + 1, len(batch_idx))
+        model = NearestNeighbors(n_neighbors=n_eff, metric="euclidean", algorithm="auto", n_jobs=1)
+        local_neighbors = model.fit(embedding[batch_idx]).kneighbors(return_distance=False)
+        for local_row, global_idx in enumerate(batch_idx):
+            candidates = batch_idx[local_neighbors[local_row]]
+            result[int(global_idx)] = candidates[candidates != global_idx][:n_neighbors]
+    return result
+
+
+def _filter_candidates(
+    candidates: np.ndarray,
+    anchor_idx: int,
+    spatial_neighbors: list[set[int]],
+    labels: np.ndarray | None,
+) -> np.ndarray:
+    filtered = np.asarray(
+        [int(c) for c in candidates if int(c) != anchor_idx and int(c) not in spatial_neighbors[anchor_idx]],
+        dtype=int,
+    )
+    if labels is None or filtered.size == 0:
+        return filtered
+
+    anchor_label = labels[anchor_idx]
+    if anchor_label is None or str(anchor_label).lower() in {"unknown", "nan", "none"}:
+        return filtered
+    return np.asarray([c for c in filtered if labels[c] != anchor_label], dtype=int)
+
+
+def train_sparcl(
+    adata,
+    *,
+    hidden_dims: tuple[int, int] = (512, 30),
+    n_epochs: int = 1000,
+    pretrain_epochs: int = 500,
+    lr: float = 0.001,
+    key_added: str = "SpaRCL",
+    gradient_clipping: float = 5.0,
+    weight_decay: float = 0.0001,
+    margin: float = 1.0,
+    random_seed: int = 0,
+    iter_comb=None,
+    knn_neigh: int = 100,
+    positive_top_k: int = 3,
+    negative_k: int = 50,
+    negative_strategy: str = "semi-hard",
+    lambda_weight: float = 1.0,
+    use_label_filter: bool = False,
+    label_key: str = "Ground Truth",
+    update_interval: int = 100,
+    gradient_checkpointing: bool = False,
+    record_negative_indices: bool = False,
+    checkpoint_dir: str | Path | None = None,
+    deterministic_algorithms: bool = True,
+    verbose: bool = False,
+    device: torch.device | None = None,
+):
+    """Train SpaRCL and store update diagnostics in ``adata.uns``.
+
+    Positive centroids are detached targets rebuilt every ``update_interval``
+    epochs, matching the submitted implementation. Semi-hard negatives strictly
+    satisfy ``d_pos < d_neg < d_pos + margin``. Anchors without a valid negative
+    are skipped.
+    """
+
+    if negative_strategy not in VALID_NEGATIVE_STRATEGIES:
+        raise ValueError(f"negative_strategy must be one of {VALID_NEGATIVE_STRATEGIES}")
+    if positive_top_k < 1 or negative_k < 1 or knn_neigh < 1:
+        raise ValueError("positive_top_k, negative_k, and knn_neigh must be positive")
+    if not 0 <= pretrain_epochs < n_epochs:
+        raise ValueError("pretrain_epochs must be in [0, n_epochs)")
+
+    present_labels = [column for column in LABEL_COLUMNS if column in adata.obs.columns]
+    if use_label_filter:
+        if label_key not in adata.obs.columns:
+            raise ValueError(f"Label filtering requires observation column {label_key!r}")
+    elif present_labels:
+        raise ValueError(
+            "Training data contain annotation columns while use_label_filter=False: "
+            + ", ".join(present_labels)
+        )
+
+    _set_seed(random_seed, deterministic_algorithms=deterministic_algorithms)
+    device = device or torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    start_time = time.time()
+
+    edge_list = adata.uns["edgeList"]
+    data = Data(
+        edge_index=torch.as_tensor(np.asarray([edge_list[0], edge_list[1]]), dtype=torch.long),
+        x=_dense_float_tensor(adata.X),
+    ).to(device)
+    if gradient_checkpointing:
+        data.x.requires_grad_(True)
+    model = SpaRCL(hidden_dims=[data.x.shape[1], hidden_dims[0], hidden_dims[1]]).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    loss_list = []
-    for epoch in tqdm(range(1, n_epochs + 1)):
+    iterator = tqdm(range(pretrain_epochs), disable=not verbose, desc="SpaRCL pretrain")
+    for _ in iterator:
         model.train()
         optimizer.zero_grad()
-        z, out = model(data.x, data.edge_index)
-        loss = F.mse_loss(data.x, out)
-        loss_list.append(loss)
+        if gradient_checkpointing:
+            z, reconstruction = checkpoint(model, data.x, data.edge_index, use_reentrant=True)
+        else:
+            z, reconstruction = model(data.x, data.edge_index)
+        loss = F.mse_loss(data.x, reconstruction)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
+        optimizer.step()
+
+    batches = adata.obs["batch_name"].to_numpy()
+    labels = adata.obs[label_key].to_numpy() if use_label_filter else None
+    section_ids = np.asarray(adata.obs["batch_name"].unique())
+    spatial_neighbors = _spatial_neighbor_sets(edge_list, adata.n_obs)
+    name_to_idx = {name: idx for idx, name in enumerate(adata.obs_names)}
+    batch_indices = {batch: np.flatnonzero(batches == batch) for batch in section_ids}
+
+    mined: dict[str, torch.Tensor] | None = None
+    previous_positive_targets: dict[tuple[str, str], np.ndarray] = {}
+    diagnostics: list[dict[str, Any]] = []
+    negative_pair_records: list[dict[str, Any]] = []
+    checkpoint_path = Path(checkpoint_dir) if checkpoint_dir is not None else None
+    if checkpoint_path is not None:
+        checkpoint_path.mkdir(parents=True, exist_ok=True)
+
+    iterator = tqdm(range(pretrain_epochs, n_epochs), disable=not verbose, desc="SpaRCL align")
+    for epoch in iterator:
+        if epoch == pretrain_epochs or (epoch - pretrain_epochs) % update_interval == 0:
+            model.eval()
+            with torch.no_grad():
+                z_update, _ = model(data.x, data.edge_index)
+            z_np = _as_numpy(z_update)
+            adata.obsm["_SpaRCL_refresh"] = z_np
+            mnn_dict = _deterministic_mnn_dictionary(
+                adata,
+                use_rep="_SpaRCL_refresh",
+                batch_name="batch_name",
+                k=knn_neigh,
+                iter_comb=iter_comb,
+            )
+            same_batch_knn = (
+                _same_batch_knn(z_np, batches, negative_k)
+                if negative_strategy == "semi-hard"
+                else None
+            )
+
+            anchor_indices: list[int] = []
+            positive_vectors: list[np.ndarray] = []
+            negative_indices: list[int] = []
+            current_positive_targets: dict[tuple[str, str], np.ndarray] = {}
+            anchors_with_positive = 0
+            skipped_no_candidates = 0
+            skipped_no_semihard = 0
+
+            for pair_key, pair_matches in mnn_dict.items():
+                for anchor_name, positive_names in pair_matches.items():
+                    anchor_idx = name_to_idx.get(anchor_name)
+                    if anchor_idx is None:
+                        continue
+                    positive_idx = [name_to_idx[name] for name in positive_names if name in name_to_idx]
+                    positive_idx = [idx for idx in positive_idx if batches[idx] != batches[anchor_idx]]
+                    if not positive_idx:
+                        continue
+
+                    anchor_vec = z_np[anchor_idx]
+                    positive_distances = np.linalg.norm(z_np[positive_idx] - anchor_vec[None, :], axis=1)
+                    selected = np.argsort(positive_distances)[: min(positive_top_k, len(positive_idx))]
+                    centroid = z_np[[positive_idx[i] for i in selected]].mean(axis=0).astype(np.float32)
+                    target_key = (str(pair_key), str(anchor_name))
+                    current_positive_targets[target_key] = centroid
+                    anchors_with_positive += 1
+
+                    if negative_strategy == "random":
+                        candidates = _filter_candidates(
+                            batch_indices[batches[anchor_idx]],
+                            anchor_idx,
+                            spatial_neighbors,
+                            labels,
+                        )
+                        if candidates.size == 0:
+                            skipped_no_candidates += 1
+                            continue
+                        negative_idx = int(np.random.choice(candidates))
+                    else:
+                        neighbors = same_batch_knn[anchor_idx] if same_batch_knn is not None else None
+                        if neighbors is None or len(neighbors) == 0:
+                            skipped_no_candidates += 1
+                            continue
+                        candidates = _filter_candidates(
+                            np.asarray(neighbors, dtype=int),
+                            anchor_idx,
+                            spatial_neighbors,
+                            labels,
+                        )
+                        if candidates.size == 0:
+                            skipped_no_candidates += 1
+                            continue
+                        negative_distances = np.linalg.norm(z_np[candidates] - anchor_vec[None, :], axis=1)
+                        positive_distance = float(np.linalg.norm(anchor_vec - centroid))
+                        valid = (negative_distances > positive_distance) & (
+                            negative_distances < positive_distance + margin
+                        )
+                        if not np.any(valid):
+                            skipped_no_semihard += 1
+                            continue
+                        valid_candidates = candidates[valid]
+                        valid_distances = negative_distances[valid]
+                        negative_idx = int(valid_candidates[np.argmin(valid_distances)])
+
+                    anchor_indices.append(anchor_idx)
+                    positive_vectors.append(centroid)
+                    negative_indices.append(negative_idx)
+
+            shared_targets = previous_positive_targets.keys() & current_positive_targets.keys()
+            drift_values = [
+                float(np.linalg.norm(current_positive_targets[key] - previous_positive_targets[key]))
+                for key in shared_targets
+            ]
+            diagnostics.append(
+                {
+                    "update_epoch": int(epoch),
+                    "positive_top_k": int(positive_top_k),
+                    "negative_strategy": negative_strategy,
+                    "label_filter": bool(use_label_filter),
+                    "positive_target_count": int(anchors_with_positive),
+                    "drift_overlap_count": int(len(drift_values)),
+                    "positive_target_drift_mean": float(np.mean(drift_values)) if drift_values else None,
+                    "positive_target_drift_std": float(np.std(drift_values, ddof=0)) if drift_values else None,
+                    "effective_triplet_count": int(len(anchor_indices)),
+                    "skipped_no_candidates": int(skipped_no_candidates),
+                    "skipped_no_semihard": int(skipped_no_semihard),
+                }
+            )
+            previous_positive_targets = current_positive_targets
+
+            if record_negative_indices:
+                negative_pair_records.append(
+                    {
+                        "update_epoch": int(epoch),
+                        "anchor_idx": np.asarray(anchor_indices, dtype=np.int32),
+                        "negative_idx": np.asarray(negative_indices, dtype=np.int32),
+                    }
+                )
+
+            if anchor_indices:
+                mined = {
+                    "anchor_idx": torch.as_tensor(anchor_indices, dtype=torch.long, device=device),
+                    "positive_vec": torch.as_tensor(
+                        np.stack(positive_vectors), dtype=torch.float32, device=device
+                    ),
+                    "negative_idx": torch.as_tensor(negative_indices, dtype=torch.long, device=device),
+                }
+            else:
+                mined = None
+
+            if checkpoint_path is not None:
+                np.savez_compressed(
+                    checkpoint_path / f"embedding_refresh_epoch_{epoch}.npz",
+                    embedding=z_np,
+                    obs_names=adata.obs_names.astype(str).to_numpy(),
+                )
+                (checkpoint_path / "training_diagnostics_so_far.json").write_text(
+                    json.dumps(diagnostics, indent=2), encoding="utf-8"
+                )
+                if record_negative_indices:
+                    np.savez_compressed(
+                        checkpoint_path / f"negative_pairs_epoch_{epoch}.npz",
+                        anchor_idx=np.asarray(anchor_indices, dtype=np.int32),
+                        negative_idx=np.asarray(negative_indices, dtype=np.int32),
+                    )
+                torch.save(
+                    {
+                        "next_epoch": int(epoch),
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "random_seed": int(random_seed),
+                    },
+                    checkpoint_path / f"checkpoint_refresh_epoch_{epoch}.pt",
+                )
+
+        model.train()
+        optimizer.zero_grad()
+        if gradient_checkpointing:
+            z, reconstruction = checkpoint(model, data.x, data.edge_index, use_reentrant=True)
+        else:
+            z, reconstruction = model(data.x, data.edge_index)
+        mse_loss = F.mse_loss(data.x, reconstruction)
+        loss = mse_loss
+        if mined is not None:
+            anchor_vec = z.index_select(0, mined["anchor_idx"])
+            negative_vec = z.index_select(0, mined["negative_idx"])
+            triplet_loss = F.triplet_margin_loss(
+                anchor_vec,
+                mined["positive_vec"],
+                negative_vec,
+                margin=margin,
+                p=2,
+                reduction="mean",
+            )
+            loss = mse_loss + lambda_weight * triplet_loss
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
         optimizer.step()
 
     model.eval()
-    z, out = model(data.x, data.edge_index)
-
-    pretrain_rep = z.to('cpu').detach().numpy()
-    adata.obsm[key_added] = pretrain_rep
-
-    try:
-        if save_loss:
-            adata.uns['SpaRCL_pre_loss'] = loss
-    except NameError:
-        pass
-
-    if save_reconstrction:
-        ReX = out.to('cpu').detach().numpy()
-        ReX[ReX < 0] = 0
-        adata.layers['SpaRCL_pre_ReX'] = ReX
-
+    with torch.no_grad():
+        embedding, _ = model(data.x, data.edge_index)
+    adata.obsm[key_added] = _as_numpy(embedding)
+    adata.uns["sparcl_training_diagnostics"] = diagnostics
+    if record_negative_indices:
+        adata.uns["sparcl_negative_pair_indices"] = negative_pair_records
+    adata.uns["sparcl_training_parameters"] = {
+        "hidden_dims": list(hidden_dims),
+        "n_epochs": int(n_epochs),
+        "pretrain_epochs": int(pretrain_epochs),
+        "knn_neigh": int(knn_neigh),
+        "margin": float(margin),
+        "positive_top_k": int(positive_top_k),
+        "negative_k": int(negative_k),
+        "lambda_weight": float(lambda_weight),
+        "negative_strategy": negative_strategy,
+        "use_label_filter": bool(use_label_filter),
+        "random_seed": int(random_seed),
+        "mnn_search": "exact",
+        "mnn_threads": 1,
+        "detached_centroid_target": True,
+        "update_interval": int(update_interval),
+        "gradient_checkpointing": bool(gradient_checkpointing),
+        "record_negative_indices": bool(record_negative_indices),
+        "checkpoint_dir": str(checkpoint_path) if checkpoint_path is not None else None,
+        "deterministic_algorithms": bool(deterministic_algorithms),
+        "runtime_seconds": float(time.time() - start_time),
+    }
     return adata
 
-def train_SpaRCL(adata, hidden_dims=[512, 30], n_epochs=1000, lr=0.001, key_added='SpaRCL',
-                 gradient_clipping=5., weight_decay=0.0001, margin=1.0, verbose=False,
-                 random_seed=666, iter_comb=None, knn_neigh=100, positive_top_k=3, negative_k=50,
-                 negative_strategy='semi-hard',  # 负采样策略
-                 lambda_weight=1.0,  # 控制三元组损失的权重
-                 device=torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')):
-    # ---------------------------
-    # 1. 辅助监控函数
-    # ---------------------------
-    def get_gpu_memory():
-        if torch.cuda.is_available() and device.type == 'cuda':
-            allocated = torch.cuda.memory_allocated(device) / 1024 ** 3
-            cached = torch.cuda.memory_reserved(device) / 1024 ** 3
-            return f"GPU内存: {allocated:.2f}GB/{cached:.2f}GB"
-        return "GPU内存: 不可用"
 
-    def get_system_info():
-        cpu = psutil.cpu_percent()
-        memory = psutil.virtual_memory()
-        return f"CPU: {cpu}%, RAM: {memory.percent}%"
+def train_SpaRCL(adata, **kwargs):
+    """Backward-compatible public name for :func:`train_sparcl`."""
 
-    # ---------------------------
-    # 2. 优化的KNN构建函数
-    # ---------------------------
-    def build_knn_optimized(z_np, batch_arr, negative_k, verbose=False):
-        knn_idx = [None] * z_np.shape[0]
-        batch_sizes = {}
-        for b in np.unique(batch_arr):
-            batch_sizes[b] = np.sum(batch_arr == b)
-
-        for i, b in enumerate(np.unique(batch_arr)):
-            idx = np.where(batch_arr == b)[0]
-            batch_size = len(idx)
-            if batch_size == 0: continue
-
-            X = z_np[idx].copy()
-            n_neighbors = min(negative_k + 1, batch_size)
-
-            if batch_size > 15000:  # 超大批次
-                chunk_size = 5000
-                n_chunks = (batch_size + chunk_size - 1) // chunk_size
-                for chunk_i in range(n_chunks):
-                    start_idx = chunk_i * chunk_size
-                    end_idx = min((chunk_i + 1) * chunk_size, batch_size)
-                    chunk_indices = np.arange(start_idx, end_idx)
-                    X_chunk = X[chunk_indices]
-                    nn = NearestNeighbors(n_neighbors=n_neighbors, metric='euclidean', algorithm='ball_tree', n_jobs=1)
-                    nn.fit(X)
-                    neigh = nn.kneighbors(X_chunk, return_distance=False)
-                    neigh = neigh[:, 1:]
-                    for local_i, global_i in enumerate(chunk_indices):
-                        knn_idx[idx[global_i]] = idx[neigh[local_i]]
-                    del nn, neigh, X_chunk
-                    gc.collect()
-            elif batch_size > 5000:  # 大批次
-                nn = NearestNeighbors(n_neighbors=n_neighbors, metric='euclidean', algorithm='ball_tree', leaf_size=50,
-                                      n_jobs=2)
-                nn.fit(X)
-                neigh = nn.kneighbors(X, return_distance=False)
-                neigh = neigh[:, 1:]
-                for row_i, gi in enumerate(idx):
-                    knn_idx[gi] = idx[neigh[row_i]]
-                del nn, neigh
-            else:  # 中小批次
-                nn = NearestNeighbors(n_neighbors=n_neighbors, metric='euclidean', algorithm='auto')
-                nn.fit(X)
-                neigh = nn.kneighbors(X, return_distance=False)
-                neigh = neigh[:, 1:]
-                for row_i, gi in enumerate(idx):
-                    knn_idx[gi] = idx[neigh[row_i]]
-                del nn, neigh
-            del X
-            gc.collect()
-        return knn_idx
-
-    # ---------------------------
-    # 3. 初始化
-    # ---------------------------
-    start_time = time.time()
-    n_cells = adata.shape[0]
-
-    print(f"开始训练 - 数据规模: {n_cells:,} 个细胞")
-    print(f"参数设置: 负采样={negative_strategy}, Lambda权重={lambda_weight}")  # 打印 lambda 信息
-    if verbose:
-        print(f"设备: {device}, 初始状态 - {get_system_info()}, {get_gpu_memory()}")
-
-    exclude_spatial_neg = True
-    label_key = next((c for c in ['Ground Truth', 'label', 'labels', 'cell_type', 'type']
-                      if c in adata.obs.columns), None)
-
-    seed = random_seed
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-
-    section_ids = np.array(adata.obs['batch_name'].unique())
-    edgeList = adata.uns['edgeList']
-    data = Data(edge_index=torch.LongTensor(np.array([edgeList[0], edgeList[1]])),
-                prune_edge_index=torch.LongTensor(np.array([])),
-                x=torch.FloatTensor(adata.X.todense())).to(device)
-
-    model = SpaRCL(hidden_dims=[data.x.shape[1], hidden_dims[0], hidden_dims[1]]).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-
-    # ---------------------------
-    # 4. 预训练 (Pretrain) - 仅使用 MSE
-    # ---------------------------
-    print('Pretrain backbone (MSE only)...')
-    pretrain_start = time.time()
-    for epoch in tqdm(range(0, 500)):
-        model.train()
-        optimizer.zero_grad()
-        z, out = model(data.x, data.edge_index)
-        loss = F.mse_loss(data.x, out)  # 预训练阶段不受 lambda 影响
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.)
-        optimizer.step()
-
-    print(f"预训练完成，耗时: {(time.time() - pretrain_start) / 60:.2f}分钟")
-    with torch.no_grad():
-        z, _ = model(data.x, data.edge_index)
-    adata.obsm['SpaRCL_pre'] = z.cpu().detach().numpy()
-
-    # ---------------------------
-    # 5. 准备工作
-    # ---------------------------
-    def _build_spatial_neighbor_sets(edge_list, n_nodes: int):
-        rows, cols = edge_list
-        neigh = [set() for _ in range(n_nodes)]
-        for u, v in zip(rows, cols):
-            if u == v: continue
-            neigh[u].add(v)
-        return neigh
-
-    spatial_neigh = _build_spatial_neighbor_sets(edgeList, n_nodes=adata.shape[0]) if exclude_spatial_neg else None
-    batch_arr = adata.obs['batch_name'].values
-    labels_arr = adata.obs[label_key].values if label_key is not None else None
-    mined = None
-
-    # ---------------------------
-    # 6. 主训练循环
-    # ---------------------------
-    print(f'Train with SpaRCL (Lambda={lambda_weight})...')
-    main_train_start = time.time()
-
-    for epoch in tqdm(range(500, n_epochs)):
-        # === 周期性更新三元组 ===
-        if epoch % 100 == 0 or epoch == 500:
-            if verbose:
-                print(f'\n=== Epoch {epoch}: 更新三元组 ({negative_strategy}) ===')
-
-            with torch.no_grad():
-                z, _ = model(data.x, data.edge_index)
-            z_np = z.detach().cpu().numpy()
-
-            # 使用专属名字存储中间特征
-            adata.obsm['SpaRCL_pre'] = z_np
-
-            # 这里使用统一的 'SpaRCL_pre' 进行 MNN 寻找
-            mnn_dict = create_dictionary_mnn(adata, use_rep='SpaRCL_pre', batch_name='batch_name',
-                                             k=knn_neigh, iter_comb=iter_comb, verbose=0)
-
-            knn_idx = None
-            if negative_strategy == 'semi-hard':
-                if verbose: print('   构建同批次KNN...')
-                knn_idx = build_knn_optimized(z_np, batch_arr, negative_k, verbose=verbose)
-
-            name2idx = dict(zip(list(adata.obs_names), range(adata.shape[0])))
-            anchor_idx_list = []
-            pos_vec_list = []
-            neg_idx_list = []
-
-            for pair_key in mnn_dict.keys():
-                for anchor_name, pos_names in mnn_dict[pair_key].items():
-                    a = name2idx.get(anchor_name, None)
-                    if a is None: continue
-
-                    pos_idx_all = [name2idx[pn] for pn in pos_names if pn in name2idx]
-                    pos_idx_all = [p for p in pos_idx_all if batch_arr[p] != batch_arr[a]]
-                    if len(pos_idx_all) == 0: continue
-
-                    a_vec = z_np[a]
-                    dists_p = np.linalg.norm(z_np[pos_idx_all] - a_vec[None, :], axis=1)
-                    order = np.argsort(dists_p)
-                    k_eff = int(min(positive_top_k, len(order)))
-                    sel = [pos_idx_all[i] for i in order[:k_eff]]
-                    pos_centroid = z_np[sel].mean(axis=0)
-
-                    neg_idx = None
-                    if negative_strategy == 'random':
-                        same_batch_indices = np.where(batch_arr == batch_arr[a])[0]
-                        candidates = same_batch_indices[same_batch_indices != a]
-                        if exclude_spatial_neg and spatial_neigh is not None:
-                            for _ in range(5):
-                                cand = np.random.choice(candidates)
-                                if cand not in spatial_neigh[a]:
-                                    neg_idx = cand
-                                    break
-                        else:
-                            if len(candidates) > 0:
-                                neg_idx = np.random.choice(candidates)
-
-                    elif negative_strategy == 'semi-hard':
-                        neighs = knn_idx[a]
-                        if neighs is None or len(neighs) == 0: continue
-                        cand = np.array(neighs, dtype=int)
-                        if spatial_neigh is not None:
-                            cand = np.array([c for c in cand if c not in spatial_neigh[a]], dtype=int)
-                        if label_key is not None:
-                            cand = np.array([c for c in cand if labels_arr[c] != labels_arr[a]], dtype=int)
-
-                        if cand.size > 0:
-                            dists_n = np.linalg.norm(z_np[cand] - a_vec[None, :], axis=1)
-                            pos_centroid_dist = np.linalg.norm(a_vec - pos_centroid)
-                            mask = dists_n > pos_centroid_dist
-                            if np.any(mask):
-                                neg_idx = cand[mask][np.argmin(dists_n[mask])]
-                            else:
-                                neg_idx = cand[np.argmin(dists_n)]
-
-                    if neg_idx is not None:
-                        anchor_idx_list.append(a)
-                        pos_vec_list.append(pos_centroid.astype(np.float32))
-                        neg_idx_list.append(int(neg_idx))
-
-            if len(anchor_idx_list) > 0:
-                mined = {
-                    'anchor_idx': torch.LongTensor(anchor_idx_list).to(device),
-                    'pos_vec': torch.from_numpy(np.stack(pos_vec_list)).float().to(device),
-                    'neg_idx': torch.LongTensor(neg_idx_list).to(device),
-                }
-            if verbose:
-                print(f'   生成 {len(anchor_idx_list)} 个三元组')
-
-        # === 梯度下降 ===
-        if mined is not None and len(mined['anchor_idx']) > 0:
-            model.train()
-            optimizer.zero_grad()
-            z, out = model(data.x, data.edge_index)
-            mse_loss = F.mse_loss(data.x, out)
-
-            anchor_arr = z.index_select(0, mined['anchor_idx'])
-            positive_arr = mined['pos_vec']
-            negative_arr = z.index_select(0, mined['neg_idx'])
-
-            triplet_loss = torch.nn.TripletMarginLoss(margin=margin, p=2, reduction='mean')
-            tri_output = triplet_loss(anchor_arr, positive_arr, negative_arr)
-
-            # --- 修改处：加入 lambda_weight ---
-            loss = mse_loss + lambda_weight * tri_output
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
-            optimizer.step()
-
-    model.eval()
-    with torch.no_grad():
-        z, _ = model(data.x, data.edge_index)
-    adata.obsm[key_added] = z.cpu().detach().numpy()
-
-    total_time = (time.time() - start_time) / 60
-    print(f"\n=== 训练完成 (Strategy: {negative_strategy}, Lambda: {lambda_weight}) ===")
-    print(f"总耗时: {total_time:.2f}分钟")
-    return adata
+    return train_sparcl(adata, **kwargs)

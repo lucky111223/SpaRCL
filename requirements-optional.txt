@@ -1,0 +1,4 @@
+# Optional clustering and legacy ICP/MNN utilities
+rpy2>=3.5
+annoy>=1.17
+hnswlib>=0.8

@@ -14,25 +14,21 @@ from torch_geometric.utils import remove_self_loops, add_self_loops, softmax
 
 
 class GATConv(MessagePassing):
-    r"""The graph attentional operator from the `"Graph Attention Networks"
-    <https://arxiv.org/abs/1710.10903>`_ paper
+    r"""Graph attention layer used by the STAGATE/STAligner backbone.
 
     .. math::
         \mathbf{x}^{\prime}_i = \alpha_{i,i}\mathbf{\Theta}\mathbf{x}_{i} +
         \sum_{j \in \mathcal{N}(i)} \alpha_{i,j}\mathbf{\Theta}\mathbf{x}_{j},
 
-    where the attention coefficients :math:`\alpha_{i,j}` are computed as
+    The implementation first applies a sigmoid transformation to the
+    compatibility score and then normalizes the transformed scores over the
+    neighborhood:
 
     .. math::
         \alpha_{i,j} =
-        \frac{
-        \exp\left(\mathrm{LeakyReLU}\left(\mathbf{a}^{\top}
-        [\mathbf{\Theta}\mathbf{x}_i \, \Vert \, \mathbf{\Theta}\mathbf{x}_j]
-        \right)\right)}
+        \frac{\exp\left(\operatorname{sigmoid}(s_{ij})\right)}
         {\sum_{k \in \mathcal{N}(i) \cup \{ i \}}
-        \exp\left(\mathrm{LeakyReLU}\left(\mathbf{a}^{\top}
-        [\mathbf{\Theta}\mathbf{x}_i \, \Vert \, \mathbf{\Theta}\mathbf{x}_k]
-        \right)\right)}.
+        \exp\left(\operatorname{sigmoid}(s_{ik})\right)}.
 
     Args:
         in_channels (int or tuple): Size of each input sample, or :obj:`-1` to

@@ -2,7 +2,6 @@ import pandas as pd
 import numpy as np
 import sklearn.neighbors
 import networkx as nx
-from .mnn_utils import create_dictionary_mnn
 
 def match_cluster_labels(true_labels,est_labels):
     true_labels_arr = np.array(list(true_labels))
@@ -218,6 +217,8 @@ def best_fit_transform(A, B):
     return T, R, t
 
 def ICP_align(adata_concat, adata_target, adata_ref, slice_target, slice_ref, landmark_domain, plot_align=False):
+    from .mnn_utils import create_dictionary_mnn
+
     ### find MNN pairs in the landmark domain with knn=1    
     adata_slice1 = adata_target[adata_target.obs['louvain'].isin(landmark_domain)]
     adata_slice2 = adata_ref[adata_ref.obs['louvain'].isin(landmark_domain)]
