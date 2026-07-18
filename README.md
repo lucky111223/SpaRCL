@@ -20,6 +20,9 @@ The optional `mclust_R` function requires R, the R package `mclust`, and
 
 ## DLPFC example
 
+The human DLPFC data are available through the
+[spatialLIBD resource](http://research.libd.org/spatialLIBD/).
+
 Place the four SpatialLIBD/10x Visium sections `151673`, `151674`, `151675`,
 and `151676` under one data directory, then run:
 
@@ -33,6 +36,9 @@ python examples/run_dlpfc4.py \
 Add `--run-mclust` when R and `mclust` are available.
 
 ## Mouse embryo example
+
+The mouse embryo Stereo-seq data are available through the
+[MOSTA resource](https://db.cngb.org/stomics/mosta/).
 
 Place the four MOSTA files below in one directory:
 
