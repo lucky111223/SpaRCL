@@ -19,7 +19,7 @@ def load_config(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def load_sections(data_dir: Path, config: dict, use_label_filter: bool):
+def load_sections(data_dir: Path, config: dict):
     sections = config["sections"]
     batches = []
     annotations = []
@@ -59,8 +59,6 @@ def load_sections(data_dir: Path, config: dict, use_label_filter: bool):
         if truth is not None:
             truth.index = new_names
             annotations.append(truth.rename("Ground Truth"))
-            if use_label_filter:
-                adata.obs["Ground Truth"] = truth.astype(str).to_numpy()
 
         local_rows, local_cols = adata.uns["adj"].nonzero()
         edge_rows.append(np.asarray(local_rows, dtype=np.int64) + offset)
@@ -79,7 +77,6 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=Path("configs/dlpfc4.json"))
-    parser.add_argument("--use-label-filter", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--run-mclust", action="store_true")
@@ -87,9 +84,7 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_config(args.config)
-    adata, annotation = load_sections(args.data_dir, config, args.use_label_filter)
-    if not args.use_label_filter and "Ground Truth" in adata.obs:
-        raise RuntimeError("Annotation data were attached before label-free training")
+    adata, annotation = load_sections(args.data_dir, config)
 
     device = torch.device("cuda:0" if args.device.startswith("cuda") and torch.cuda.is_available() else "cpu")
     adata = train_SpaRCL(
@@ -108,15 +103,13 @@ def main() -> None:
         knn_neigh=int(config["knn_neigh"]),
         negative_strategy=config["negative_strategy"],
         random_seed=args.seed,
-        use_label_filter=args.use_label_filter,
-        label_key="Ground Truth",
         key_added="SpaRCL",
         device=device,
         verbose=True,
     )
 
     # Attach annotations after training when they are used only for evaluation.
-    if annotation is not None and not args.use_label_filter:
+    if annotation is not None:
         adata.obs["Ground Truth"] = annotation.astype(str).to_numpy()
     if args.run_mclust:
         mclust_R(
@@ -139,7 +132,7 @@ def main() -> None:
     )
     (args.output_dir / "run_config.json").write_text(
         json.dumps(
-            {**config, "use_label_filter": args.use_label_filter, "seed": args.seed},
+            {**config, "seed": args.seed},
             indent=2,
         ),
         encoding="utf-8",

@@ -19,7 +19,6 @@ from torch_geometric.data import Data
 from tqdm import tqdm
 
 from .SpaRCL import SpaRCL
-from .label_schema import LABEL_COLUMNS
 
 
 VALID_NEGATIVE_STRATEGIES = ("semi-hard", "random")
@@ -128,19 +127,11 @@ def _filter_candidates(
     candidates: np.ndarray,
     anchor_idx: int,
     spatial_neighbors: list[set[int]],
-    labels: np.ndarray | None,
 ) -> np.ndarray:
-    filtered = np.asarray(
+    return np.asarray(
         [int(c) for c in candidates if int(c) != anchor_idx and int(c) not in spatial_neighbors[anchor_idx]],
         dtype=int,
     )
-    if labels is None or filtered.size == 0:
-        return filtered
-
-    anchor_label = labels[anchor_idx]
-    if anchor_label is None or str(anchor_label).lower() in {"unknown", "nan", "none"}:
-        return filtered
-    return np.asarray([c for c in filtered if labels[c] != anchor_label], dtype=int)
 
 
 def train_sparcl(
@@ -161,8 +152,6 @@ def train_sparcl(
     negative_k: int = 50,
     negative_strategy: str = "semi-hard",
     lambda_weight: float = 1.0,
-    use_label_filter: bool = False,
-    label_key: str = "Ground Truth",
     update_interval: int = 100,
     gradient_checkpointing: bool = False,
     record_negative_indices: bool = False,
@@ -185,16 +174,6 @@ def train_sparcl(
         raise ValueError("positive_top_k, negative_k, and knn_neigh must be positive")
     if not 0 <= pretrain_epochs < n_epochs:
         raise ValueError("pretrain_epochs must be in [0, n_epochs)")
-
-    present_labels = [column for column in LABEL_COLUMNS if column in adata.obs.columns]
-    if use_label_filter:
-        if label_key not in adata.obs.columns:
-            raise ValueError(f"Label filtering requires observation column {label_key!r}")
-    elif present_labels:
-        raise ValueError(
-            "Training data contain annotation columns while use_label_filter=False: "
-            + ", ".join(present_labels)
-        )
 
     _set_seed(random_seed, deterministic_algorithms=deterministic_algorithms)
     device = device or torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -224,7 +203,6 @@ def train_sparcl(
         optimizer.step()
 
     batches = adata.obs["batch_name"].to_numpy()
-    labels = adata.obs[label_key].to_numpy() if use_label_filter else None
     section_ids = np.asarray(adata.obs["batch_name"].unique())
     spatial_neighbors = _spatial_neighbor_sets(edge_list, adata.n_obs)
     name_to_idx = {name: idx for idx, name in enumerate(adata.obs_names)}
@@ -290,7 +268,6 @@ def train_sparcl(
                             batch_indices[batches[anchor_idx]],
                             anchor_idx,
                             spatial_neighbors,
-                            labels,
                         )
                         if candidates.size == 0:
                             skipped_no_candidates += 1
@@ -305,7 +282,6 @@ def train_sparcl(
                             np.asarray(neighbors, dtype=int),
                             anchor_idx,
                             spatial_neighbors,
-                            labels,
                         )
                         if candidates.size == 0:
                             skipped_no_candidates += 1
@@ -336,7 +312,6 @@ def train_sparcl(
                     "update_epoch": int(epoch),
                     "positive_top_k": int(positive_top_k),
                     "negative_strategy": negative_strategy,
-                    "label_filter": bool(use_label_filter),
                     "positive_target_count": int(anchors_with_positive),
                     "drift_overlap_count": int(len(drift_values)),
                     "positive_target_drift_mean": float(np.mean(drift_values)) if drift_values else None,
@@ -434,7 +409,6 @@ def train_sparcl(
         "negative_k": int(negative_k),
         "lambda_weight": float(lambda_weight),
         "negative_strategy": negative_strategy,
-        "use_label_filter": bool(use_label_filter),
         "random_seed": int(random_seed),
         "mnn_search": "exact",
         "mnn_threads": 1,

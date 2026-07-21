@@ -19,7 +19,7 @@ class RepositoryContractTests(unittest.TestCase):
             config = json.loads((ROOT / "configs" / name).read_text(encoding="utf-8"))
             self.assertEqual(config["mclust_model"], "EEE")
 
-    def test_training_default_is_label_free_and_named_sparcl(self):
+    def test_training_has_no_label_filter_and_is_named_sparcl(self):
         source = (ROOT / "SpaRCL_GitHub" / "SpaRCL" / "train_SpaRCL.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
         function = next(
@@ -28,8 +28,10 @@ class RepositoryContractTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef) and node.name == "train_sparcl"
         )
         defaults = dict(zip((arg.arg for arg in function.args.kwonlyargs), function.args.kw_defaults))
-        self.assertFalse(ast.literal_eval(defaults["use_label_filter"]))
         self.assertEqual(ast.literal_eval(defaults["key_added"]), "SpaRCL")
+        self.assertNotIn("use_label_filter", defaults)
+        self.assertNotIn("label_key", defaults)
+        self.assertNotIn("Ground Truth", source)
         self.assertIn("negative_distances < positive_distance + margin", source)
 
     def test_mouse_embryo_settings_match_the_executed_workflow(self):

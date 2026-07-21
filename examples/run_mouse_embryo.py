@@ -116,7 +116,6 @@ def main() -> None:
         negative_strategy=config["negative_strategy"],
         iter_comb=[tuple(pair) for pair in config["mnn_iter_comb"]],
         random_seed=training_seed,
-        use_label_filter=False,
         deterministic_algorithms=bool(config["deterministic_algorithms"]),
         key_added="SpaRCL",
         device=device,
